@@ -257,21 +257,45 @@ mod tests {
         assert_eq!(state_of(res), D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
 
-    /// The round trip of a D16 depth buffer that shaders write: its clear reaches the twin at the
-    /// barrier into UNORDERED_ACCESS, a write through the twin's UAV reaches the depth buffer at
-    /// the barrier out of it, and the depth buffer is in the state it was made in afterwards.
     #[test]
     fn gpu_a_uav_write_to_a_depth_buffer_goes_through_its_twin() {
+        gpu_round_trip(DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, 2);
+    }
+
+    #[test]
+    fn gpu_d32_depth_and_r32_float_uav_round_trip() {
+        gpu_round_trip(DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, 4);
+    }
+
+    /// A depth clear reaches the twin, then a typed UAV write reaches the depth buffer.
+    fn gpu_round_trip(texture_format: DXGI_FORMAT, dsv_format: DXGI_FORMAT, uav_format: DXGI_FORMAT, bytes_per_pixel: usize) {
+        use crate::gpu::{adapter, fence, recomp::runner::skip_test};
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
         unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let selector = adapter::Selector::from_env_or("auto");
+            let Some((chosen, chosen_desc)) = adapter::candidates(&factory, &selector).into_iter().next() else {
+                skip_test(&adapter::no_match(&factory, &selector));
+                return;
+            };
             let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
+            if let Err(e) = D3D12CreateDevice(&chosen, D3D_FEATURE_LEVEL_11_0, &mut dev) {
+                skip_test(&format!("D3D12CreateDevice failed: {e}"));
                 return;
             }
             let dev = dev.unwrap();
+            let luid = dev.GetAdapterLuid();
+            assert_eq!((luid.HighPart, luid.LowPart), (chosen_desc.AdapterLuid.HighPart, chosen_desc.AdapterLuid.LowPart));
+            let actual: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).unwrap();
+            let info = actual.GetDesc1().unwrap();
+            println!(
+                "D3D12 adapter: {} (LUID {:08x}:{:08x}, PCI {:04x}:{:04x})",
+                adapter::name(&info), luid.HighPart, luid.LowPart, info.VendorId, info.DeviceId
+            );
             let (w, h) = (64u32, 32u32);
-            let mut d = depth_desc(DXGI_FORMAT_R16_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            let mut d = depth_desc(texture_format, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
             (d.Width, d.Height, d.DepthOrArraySize, d.Alignment) = (w as u64, h, 1, 0);
             let default = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
             let mut depth: Option<ID3D12Resource> = None;
@@ -287,13 +311,15 @@ mod tests {
             let dsv_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
             let (gpu_heap, cpu_heap) = (heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE), heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE));
             let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
-            dev.CreateDepthStencilView(&depth, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D16_UNORM, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() }), dsv);
-            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT_R16_UNORM, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
+            dev.CreateDepthStencilView(&depth, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC { Format: dsv_format, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() }), dsv);
+            let uav = twin_uav_desc(&twin.GetDesc());
+            assert_eq!(uav.Format, uav_format);
             dev.CreateUnorderedAccessView(&twin, None, Some(&uav), gpu_heap.GetCPUDescriptorHandleForHeapStart());
             dev.CreateUnorderedAccessView(&twin, None, Some(&uav), cpu_heap.GetCPUDescriptorHandleForHeapStart());
 
-            // a readback buffer for one texture of R16 (rows of 256 bytes)
+            // Both formats fit in a 256-byte aligned row at this width.
             let pitch = 256u32;
+            assert!(w as usize * bytes_per_pixel <= pitch as usize);
             let rb_desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                 Width: (pitch * h) as u64,
@@ -309,7 +335,7 @@ mod tests {
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let mut fence_value = 0u64;
             // one list: `record`, then a copy of `src` (in `state`) to a readback buffer, run and read
-            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList), src: &ID3D12Resource, state: D3D12_RESOURCE_STATES, fence_value: &mut u64| -> Vec<u16> {
+            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList), src: &ID3D12Resource, state: D3D12_RESOURCE_STATES, fence_value: &mut u64| -> Vec<u32> {
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
                 let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
                 record(&list);
@@ -319,7 +345,7 @@ mod tests {
                 list.ResourceBarrier(&[transition(src, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                     Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R16_TYPELESS, Width: w, Height: h, Depth: 1, RowPitch: pitch },
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: texture_format, Width: w, Height: h, Depth: 1, RowPitch: pitch },
                 };
                 let to = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
                 let from = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
@@ -329,15 +355,32 @@ mod tests {
                 q.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
                 *fence_value += 1;
                 q.Signal(&fence, *fence_value).unwrap();
-                while fence.GetCompletedValue() < *fence_value {
-                    std::thread::yield_now();
-                }
+                fence::wait(&fence, *fence_value, &dev, None, 10_000).unwrap();
                 let mut p: *mut c_void = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).unwrap();
                 let rows = std::slice::from_raw_parts(p as *const u8, (pitch * h) as usize);
-                let px: Vec<u16> = (0..h as usize).flat_map(|y| (0..w as usize).map(move |x| u16::from_le_bytes([rows[y * pitch as usize + 2 * x], rows[y * pitch as usize + 2 * x + 1]]))).collect();
+                let px = rows.chunks_exact(pitch as usize)
+                    .flat_map(|row| row[..w as usize * bytes_per_pixel].chunks_exact(bytes_per_pixel))
+                    .map(|pixel| {
+                        let mut bits = [0; 4];
+                        bits[..bytes_per_pixel].copy_from_slice(pixel);
+                        u32::from_le_bytes(bits)
+                    })
+                    .collect();
                 rb.Unmap(0, None);
                 px
+            };
+            let verify = |pixels: &[u32], expected: f32, stage: &str| {
+                let min = *pixels.iter().min().unwrap();
+                let max = *pixels.iter().max().unwrap();
+                println!("{dsv_format:?}/{uav_format:?} {stage}: {} texels, raw range {min:#010x}..={max:#010x}", pixels.len());
+                assert_eq!(pixels.len(), (w * h) as usize);
+                if bytes_per_pixel == 4 {
+                    assert!(pixels.iter().all(|&bits| f32::from_bits(bits) == expected), "{stage}: expected {expected}");
+                } else {
+                    let unorm = (expected * 65535.0).round() as u32;
+                    assert!(pixels.iter().all(|&bits| bits.abs_diff(unorm) <= 1), "{stage}: expected approximately {unorm}");
+                }
             };
 
             // the depth buffer cleared to 0.25, then the barrier into UNORDERED_ACCESS: the twin has it
@@ -346,7 +389,7 @@ mod tests {
                 assert!(sync(depth.as_raw() as usize, true, &|b| l.ResourceBarrier(b), &|dst, src| l.CopyResource(dst, src)));
             };
             let twin_px = run(&into, &twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mut fence_value);
-            assert!(twin_px.iter().all(|&v| v.abs_diff(16384) <= 1), "the twin has the depth buffer's 0.25: {:?}", &twin_px[..4]);
+            verify(&twin_px, 0.25, "depth -> twin");
 
             // a write through the twin's UAV (0.75), then the barrier out of UNORDERED_ACCESS: the depth buffer has it
             let out = |l: &ID3D12GraphicsCommandList| {
@@ -355,7 +398,7 @@ mod tests {
                 assert!(sync(depth.as_raw() as usize, false, &|b| l.ResourceBarrier(b), &|dst, src| l.CopyResource(dst, src)));
             };
             let depth_px = run(&out, &depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, &mut fence_value);
-            assert!(depth_px.iter().all(|&v| v.abs_diff(49151) <= 1), "the depth buffer has the UAV's 0.75: {:?}", &depth_px[..4]);
+            verify(&depth_px, 0.75, "twin -> depth");
             assert_eq!(dev.GetDeviceRemovedReason(), Ok(()), "the device is still there");
         }
     }
